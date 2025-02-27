@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 import openai
-#import gspread
-#from oauth2client.service_account import ServiceAccountCredentials
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import os
 
 # Access OpenAI API key securely from Streamlit secrets (or hardcode for local testing)
