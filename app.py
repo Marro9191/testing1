@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-#import matplotlib.pyplot as plt
-#import seaborn as sns
-#from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
 import openai
-#import gspread
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 
@@ -228,7 +228,7 @@ def main():
                         st.error(f"Error during analysis: {str(e)}")
             else:
                 st.error("Please enter a query to analyze")
-    
+
     else:
         st.write("This feature is coming soon!")
 
