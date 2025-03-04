@@ -1,236 +1,281 @@
 import streamlit as st
+from openai import OpenAI
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.graph_objects as go
 from datetime import datetime
-import openai
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import os
+import requests
 
-# Access OpenAI API key securely from Streamlit secrets (or hardcode for local testing)
-if 'OPENAI_API_KEY' in st.secrets["openai"]:
-    openai.api_key = st.secrets["openai"]["api_key"]
-else:
-    # For local testing, hardcode the API key (remove for deployment)
-    openai.api_key = "your_openai_api_key_here"  # Replace with your key for local testing only
+# Add sidebar with menu items
+st.sidebar.title("Navigation")
+menu = st.sidebar.radio("Menu", ["Insight Conversation", "Shopify Catalog Analysis"])
 
-# Set page configuration
-st.set_page_config(page_title="Conversation Insights Dashboard", layout="wide")
-
-# Custom CSS for styling
+# Initialize OpenAI client
 try:
-    st.markdown("""
-        <style>
-        .stChatMessage {
-            border-radius: 10px;
-            padding: 10px;
-            margin: 5px 0;
-        }
-        .user-message { background-color: #f0f2f6; }
-        .bot-message { background-color: #e8f5e9; }
-        </style>
-    """, unsafe_allow_html=True)
-    st.write("CSS loaded successfully")
-except Exception as e:
-    st.error(f"Error loading CSS: {str(e)}")
+    openai_api_key = st.secrets["openai"]["api_key"]
+    client = OpenAI(api_key=openai_api_key)
+except KeyError:
+    st.error("Please add your OpenAI API key to `.streamlit/secrets.toml` under the key `openai.api_key`.")
+    st.stop()
 
-# Connect to Google Sheets securely (service account)
-@st.cache_data(ttl=600)  # Cache data for 10 minutes
-def load_google_sheet():
+# Function to fetch Shopify products
+def fetch_shopify_products():
     try:
-        # Check if running locally or on Streamlit Cloud
-        if 'GOOGLE_SHEETS_CREDENTIALS' in st.secrets["connections.gsheets"]:
-            # Use secrets for Streamlit Cloud
-            credentials_info = st.secrets["connections.gsheets"]["GOOGLE_SHEETS_CREDENTIALS"]
-            credentials = ServiceAccountCredentials.from_json_keyfile_dict(
-                credentials_info,
-                scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            )
-        else:
-            # For local testing, use credentials.json file
-            credentials = ServiceAccountCredentials.from_json_keyfile_name(
-                'credentials.json',
-                scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            )
+        shopify_domain = st.secrets["shopify"]["domain"]  # e.g., "your-store.myshopify.com"
+        api_key = st.secrets["shopify"]["api_key"]
+        password = st.secrets["shopify"]["password"]
+        api_version = "2023-10"  # Use a specific version
 
-        client = gspread.authorize(credentials)
-        
-        # Get spreadsheet ID from secrets or use a default for local testing
-        spreadsheet_id = st.secrets["connections.gsheets"].get("spreadsheet", "YOUR_SPREADSHEET_ID")
-        if spreadsheet_id == "YOUR_SPREADSHEET_ID":
-            st.error("Please configure the spreadsheet ID in secrets.toml or credentials.json for local testing.")
-            return pd.DataFrame()
+        url = f"https://{api_key}:{password}@{shopify_domain}/admin/api/{api_version}/products.json"
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an error for bad status codes
 
-        spreadsheet = client.open_by_key(spreadsheet_id.split("/d/")[1].split("/edit")[0])
-        worksheet = spreadsheet.sheet1  # Adjust worksheet name if needed
-        data = worksheet.get_all_records()
-        return pd.DataFrame(data)
+        products = response.json()["products"]
+        # Flatten relevant product data into a DataFrame
+        product_data = []
+        for product in products:
+            for variant in product["variants"]:
+                product_data.append({
+                    "product_id": product["id"],
+                    "title": product["title"],
+                    "variant_id": variant["id"],
+                    "sku": variant["sku"],
+                    "price": float(variant["price"]),
+                    "inventory_quantity": variant["inventory_quantity"],
+                    "created_at": pd.to_datetime(product["created_at"]),
+                    "updated_at": pd.to_datetime(product["updated_at"]),
+                    "category": product.get("product_type", "Uncategorized")
+                })
+        return pd.DataFrame(product_data)
     except Exception as e:
-        st.error(f"Error loading Google Sheet: {str(e)}")
+        st.error(f"Error fetching Shopify data: {str(e)}")
         return pd.DataFrame()
 
-def generate_nlp_response(conversation_text, context=None, data=None):
-    """Generate an advanced NLP response using OpenAI's GPT API (version 1.0.0+) and analyze Google Sheet data"""
-    try:
-        # Prepare the prompt with context, data summary, and user query
-        prompt = f"User query: {conversation_text}\n\n"
-        if context:
-            prompt += f"Context: {context}\n\n"
-        if data is not None and not data.empty:
-            prompt += f"Available data columns: {list(data.columns)}\nData summary: {data.describe().to_string()}\n\n"
-        prompt += "Provide a natural, concise response as a helpful AI assistant for analyzing business data from Google Sheets. If the user asks about a top-performing product, returns, or specific metrics, suggest insights, calculations, or visualizations based on the data. Return the response in this format: 'Response: [your response]' and if a graph is needed, include 'Graph: [description of the graph, e.g., bar chart of top products by performance]'."
+# Insight Conversation (Original Code)
+if menu == "Insight Conversation":
+    st.title("📄 Comcore Prototype v1")
+    st.write(
+        "Upload CSV file below and ask analytical questions. "
+        "Supported formats: .csv, "
+        "and you can also visualize the data with customizable charts. "
+        "Please note it has to be UTF-8 encoded."
+    )
 
-        # Call OpenAI API with the new chat completions endpoint
-        response = openai.chat.completions.create(
-            model="gpt-3.5-turbo",  # Use "gpt-4" for more advanced responses if available
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant for analyzing business data from Google Sheets and providing insights or visualizations."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=300,  # Increased for more detailed responses
-            temperature=0.7  # Balanced between creativity and coherence
+    # File uploader
+    uploaded_file = st.file_uploader(
+        "Upload a document (.csv)",
+        type="csv"
+    )
+
+    # Question input
+    question = st.text_area(
+        "Now ask a question about the document!",
+        placeholder="Example: What were total number of reviews last month compared to this month for toothbrush category?",
+        disabled=not uploaded_file,
+    )
+
+    if uploaded_file and question:
+        # Process CSV file
+        df = pd.read_csv(uploaded_file)
+        document = df.to_string()
+
+        # Convert date column to datetime
+        df['date'] = pd.to_datetime(df['date'], format='%d/%m/%Y', errors='coerce')
+
+        # Create message for OpenAI
+        messages = [
+            {
+                "role": "user",
+                "content": f"Here's a document: {document} \n\n---\n\n {question}",
+            }
+        ]
+
+        # Generate answer using OpenAI
+        stream = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            stream=True,
         )
-        
-        full_response = response.choices[0].message.content.strip()
-        # Parse the response for text and graph instructions
-        if "Response:" in full_response and "Graph:" in full_response:
-            response_text = full_response.split("Response:")[1].split("Graph:")[0].strip()
-            graph_instruction = full_response.split("Graph:")[1].strip()
-            return response_text, graph_instruction
-        return full_response, None
-    except Exception as e:
-        st.error(f"Error generating NLP response: {str(e)}")
-        return "Sorry, I encountered an issue processing your request.", None
 
-def create_graph(data, graph_instruction):
-    """Create a graph based on the OpenAI instruction"""
-    try:
-        if "bar chart" in graph_instruction.lower():
-            if "top products" in graph_instruction.lower() and "performance" in graph_instruction.lower():
-                top_products = data.sort_values(by="Performance", ascending=False).head(5)  # Adjust column name as needed
-                fig, ax = plt.subplots(figsize=(5, 3))
-                sns.barplot(data=top_products, x="Product", y="Performance", ax=ax)  # Adjust column names
-                ax.set_title("Top 5 Products by Performance")
-                ax.set_xlabel("Product")
-                ax.set_ylabel("Performance")
-                return fig
-            elif "returns" in graph_instruction.lower():
-                fig, ax = plt.subplots(figsize=(5, 3))
-                sns.barplot(data=data, x="Product", y="Returns", ax=ax)  # Adjust column names
-                ax.set_title("Returns by Product")
-                ax.set_xlabel("Product")
-                ax.set_ylabel("Returns")
-                return fig
-        elif "line chart" in graph_instruction.lower():
-            if "performance over time" in graph_instruction.lower():
-                fig, ax = plt.subplots(figsize=(5, 3))
-                sns.lineplot(data=data, x="Date", y="Performance", ax=ax)  # Adjust column names
-                ax.set_title("Performance Over Time")
-                ax.set_xlabel("Date")
-                ax.set_ylabel("Performance")
-                return fig
-        return None
-    except Exception as e:
-        st.error(f"Error creating graph: {str(e)}")
-        return None
+        # Display response
+        st.subheader("Response")
+        st.write_stream(stream)
 
-def process_conversation(conversation_text, context=None):
-    """Process the conversation text with advanced NLP, analyze Google Sheet data, and return analysis"""
-    try:
-        # Load data from Google Sheets
-        data = load_google_sheet()
-        
-        # Generate NLP response and graph instruction
-        nlp_response, graph_instruction = generate_nlp_response(conversation_text, context, data)
-        
-        # Simple keyword-based analysis for insights (can be enhanced with NLP)
-        lines = conversation_text.strip().split('\n')
-        analysis = {"insights": [], "graphs": [], "response": nlp_response}
-        
-        for line in lines:
-            if "top performing product" in line.lower():
-                if not data.empty:
-                    top_product = data.loc[data["Performance"].idxmax()]  # Adjust column name
-                    analysis["insights"].append(f"Top-performing product: {top_product['Product']} with performance {top_product['Performance']}")
-            elif "drove most return" in line.lower():
-                if not data.empty:
-                    top_return = data.loc[data["Returns"].idxmax()]  # Adjust column name
-                    analysis["insights"].append(f"Product with most returns: {top_return['Product']} with returns {top_return['Returns']}")
-        
-        # Create graph if instructed
-        if graph_instruction and not data.empty:
-            graph = create_graph(data, graph_instruction)
-            if graph:
-                analysis["graphs"].append(graph)
-        
-        return analysis
-    except Exception as e:
-        st.error(f"Error in process_conversation: {str(e)}")
-        return {"insights": [], "graphs": [], "response": "Sorry, I encountered an error processing your request."}
+        # Custom analysis for review comparison query
+        if "reviews" in question.lower() and "last month" in question.lower() and "this month" in question.lower():
+            current_date = datetime.now()
+            current_month = current_date.month
+            current_year = current_date.year
+            
+            # Adjust for if current month is January
+            last_month_year = current_year - 1 if current_month == 1 else current_year
+            last_month = 12 if current_month == 1 else current_month - 1
 
-def main():
-    st.title("Conversation Insights Dashboard")
-    
-    # Initialize session state for conversation context
-    if 'conversation_history' not in st.session_state:
-        st.session_state.conversation_history = []
-    
-    st.sidebar.title("Navigation")
-    pages = ["Dashboard", "Insights", "Recommendations", "Content Quality", 
-             "Search Placement", "Reviews & Ratings", "Pricing", "KPIs", "Audits", "Accounts", "Help"]
-    selected_page = st.sidebar.radio("", pages)
-    
-    st.header(selected_page)
-    
-    if selected_page == "Dashboard":
-        st.subheader("Enter Conversation or Prompt")
-        
-        conversation = st.text_area("Type your query about the data (e.g., 'Show me the top-performing product' or 'Graph returns over time')", height=200)
-        
-        if st.button("Analyze"):
-            if conversation:
-                with st.spinner("Analyzing conversation and data..."):
-                    try:
-                        # Add user input to conversation history
-                        st.session_state.conversation_history.append({"role": "user", "content": conversation})
-                        
-                        # Process the conversation with context from history
-                        context = "\n".join([f"{msg['role']}: {msg['content']}" for msg in st.session_state.conversation_history])
-                        analysis = process_conversation(conversation, context)
-                    
-                        # Display the system's conversational response
-                        if analysis["response"]:
-                            st.markdown(f'<div class="stChatMessage bot-message">Bot: {analysis["response"]}</div>', unsafe_allow_html=True)
-                            st.session_state.conversation_history.append({"role": "bot", "content": analysis["response"]})
-                        
-                        # Display conversation history
-                        st.subheader("Conversation History")
-                        for msg in st.session_state.conversation_history:
-                            role_class = "user-message" if msg["role"] == "user" else "bot-message"
-                            st.markdown(f'<div class="stChatMessage {role_class}">{"You" if msg["role"] == "user" else "Bot"}: {msg["content"]}</div>', unsafe_allow_html=True)
-                        
-                        # Display insights
-                        st.subheader("Analysis Insights")
-                        for insight in analysis["insights"]:
-                            st.write(f"- {insight}")
-                        
-                        # Display graphs
-                        st.subheader("Visualizations")
-                        for graph in analysis["graphs"]:
-                            st.pyplot(graph)
-                        
-                        # Feedback
-                        st.text_input("Feedback", key="feedback")
-                        if st.button("Submit Feedback"):
-                            st.success("Thank you for your feedback!")
-                    except Exception as e:
-                        st.error(f"Error during analysis: {str(e)}")
+            # Filter data based on category if specified
+            category = "Toothbrush" if "toothbrush" in question.lower() else None
+            if category:
+                df_filtered = df[df['category'].str.lower() == category.lower()]
             else:
-                st.error("Please enter a query to analyze")
+                df_filtered = df
 
+            # Calculate totals
+            this_month_data = df_filtered[
+                (df_filtered['date'].dt.month == current_month) & 
+                (df_filtered['date'].dt.year == current_year)
+            ]
+            last_month_data = df_filtered[
+                (df_filtered['date'].dt.month == last_month) & 
+                (df_filtered['date'].dt.year == last_month_year)
+            ]
+
+            this_month_reviews = this_month_data['reviews'].sum() if 'reviews' in this_month_data.columns else 0
+            last_month_reviews = last_month_data['reviews'].sum() if 'reviews' in last_month_data.columns else 0
+
+            # Display results
+            st.subheader("Analysis Results")
+            st.write(f"Total Reviews This Month: {this_month_reviews}")
+            st.write(f"Total Reviews Last Month: {last_month_reviews}")
+
+            # Generate visualization
+            st.subheader("Visualization")
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=['Last Month', 'This Month'],
+                    y=[last_month_reviews, this_month_reviews],
+                    marker_color=['#FF6B6B', '#4ECDC4']
+                )
+            ])
+            
+            fig.update_layout(
+                title=f"Reviews Comparison - {category if category else 'All Categories'}",
+                xaxis_title="Period",
+                yaxis_title="Number of Reviews",
+                height=500,
+                width=700
+            )
+            
+            st.plotly_chart(fig)
+
+        # General visualization options
+        st.subheader("Custom Visualization")
+        if not df.empty:
+            chart_type = st.selectbox("Chart Type", ["Bar", "Line", "Pie", "Scatter", "Area"])
+            x_col = st.selectbox("X-axis", df.columns)
+            numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+            
+            if len(numeric_cols) > 0:
+                y_col = st.selectbox("Y-axis", numeric_cols)
+                
+                color_option = st.selectbox("Color by", ["Single Color"] + df.columns.tolist())
+                if color_option == "Single Color":
+                    color = st.color_picker("Pick a color", "#00f900")
+                else:
+                    color = color_option
+
+                chart_title = st.text_input("Chart Title", "Data Visualization")
+                
+                if st.button("Generate Chart"):
+                    fig = go.Figure()
+                    
+                    if chart_type == "Bar":
+                        fig.add_trace(go.Bar(x=df[x_col], y=df[y_col], marker_color=color if color_option == "Single Color" else None))
+                    elif chart_type == "Line":
+                        fig.add_trace(go.Scatter(x=df[x_col], y=df[y_col], mode='lines', line=dict(color=color if color_option == "Single Color" else None)))
+                    elif chart_type == "Pie":
+                        pie_data = df.groupby(x_col)[y_col].sum()
+                        fig.add_trace(go.Pie(labels=pie_data.index, values=pie_data.values))
+                    elif chart_type == "Scatter":
+                        fig.add_trace(go.Scatter(
+                            x=df[x_col], 
+                            y=df[y_col], 
+                            mode='markers',
+                            marker=dict(color=df[color] if color_option != "Single Color" else color, size=10)
+                        ))
+                    elif chart_type == "Area":
+                        fig.add_trace(go.Scatter(
+                            x=df[x_col], 
+                            y=df[y_col], 
+                            fill='tozeroy',
+                            line=dict(color=color if color_option == "Single Color" else None)
+                        ))
+
+                    fig.update_layout(
+                        title=chart_title,
+                        xaxis_title=x_col,
+                        yaxis_title=y_col,
+                        height=500,
+                        width=700
+                    )
+                    
+                    st.plotly_chart(fig)
+            else:
+                st.warning("No numeric columns available for charting.")
+        else:
+            st.warning("The uploaded data is empty.")
+
+# Shopify Catalog Analysis (New Section)
+elif menu == "Shopify Catalog Analysis":
+    st.title("🛒 Shopify Catalog Analysis")
+    st.write(
+        "Ask analytical questions about your Shopify product catalog. "
+        "Data is fetched directly from your Shopify store."
+    )
+
+    # Fetch and cache Shopify data in session state
+    if "shopify_df" not in st.session_state:
+        with st.spinner("Fetching Shopify catalog data..."):
+            st.session_state.shopify_df = fetch_shopify_products()
+
+    df = st.session_state.shopify_df
+
+    if df.empty:
+        st.warning("No data fetched from Shopify. Check your API credentials.")
     else:
-        st.write("This feature is coming soon!")
+        # Question input
+        question = st.text_area(
+            "Ask a question about your Shopify catalog!",
+            placeholder="Example: What is the total inventory value? How many products are in the 'Electronics' category?",
+        )
 
-if __name__ == "__main__":
-    main()
+        if question:
+            document = df.to_string()
+            messages = [{"role": "user", "content": f"Here's the Shopify catalog data: {document} \n\n---\n\n {question}"}]
+            stream = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages, stream=True)
+            st.subheader("Response")
+            st.write_stream(stream)
+
+            # Custom analysis example: Total inventory value
+            if "inventory value" in question.lower():
+                total_value = (df["price"] * df["inventory_quantity"]).sum()
+                st.subheader("Analysis Result")
+                st.write(f"Total Inventory Value: ${total_value:,.2f}")
+
+                # Visualization
+                fig = go.Figure(data=[
+                    go.Bar(
+                        x=df["title"],
+                        y=df["price"] * df["inventory_quantity"],
+                        marker_color="#4ECDC4"
+                    )
+                ])
+                fig.update_layout(
+                    title="Inventory Value by Product",
+                    xaxis_title="Product",
+                    yaxis_title="Value ($)",
+                    height=500,
+                    width=700
+                )
+                st.plotly_chart(fig)
+
+            # Custom analysis example: Products by category
+            if "category" in question.lower():
+                category = "Electronics" if "electronics" in question.lower() else None
+                if category:
+                    category_count = df[df["category"].str.lower() == category.lower()].shape[0]
+                    st.subheader("Analysis Result")
+                    st.write(f"Number of products in '{category}' category: {category_count}")
+
+                    # Visualization
+                    category_counts = df["category"].value_counts()
+                    fig = go.Figure(data=[go.Pie(labels=category_counts.index, values=category_counts.values)])
+                    fig.update_layout(title="Product Distribution by Category", height=500, width=700)
+                    st.plotly_chart(fig)
